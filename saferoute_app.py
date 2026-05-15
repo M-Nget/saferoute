@@ -1,504 +1,713 @@
-import flet as ft, threading, time, random, sqlite3, json
-from datetime import datetime
+"""
+SafeRoute — RTI Risk Prediction App
+Single-file, self-contained. Run with: python saferoute_app.py
+"""
+
+import flet as ft
+import threading
+import time
+import math
+import random
+import sqlite3
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 
-def border_all(w,c):
-    s=ft.BorderSide(w,c)
-    return ft.Border(top=s,bottom=s,left=s,right=s)
-def pad(l=0,r=0,t=0,b=0): return ft.Padding(left=l,right=r,top=t,bottom=b)
-def pad_all(v): return pad(v,v,v,v)
-def pad_hv(h,v): return pad(h,h,v,v)
-def mar_all(v): return ft.Margin(left=v,right=v,top=v,bottom=v)
-CENTER=ft.Alignment(0,0)
-DB=Path("saferoute.db")
-C=dict(bg="#0D1117",surf="#161B22",surf2="#21262D",bord="#30363D",
-       pri="#00D4AA",warn="#F4A261",dang="#E76F51",crit="#C1121F",
-       txt="#E6EDF3",dim="#7D8590")
+# ══════════════════════════════════════════════════════════════════
+# CONSTANTS & THEME
+# ══════════════════════════════════════════════════════════════════
 
-def tier(s):
-    if s<3: return "LOW","#00D4AA"
-    if s<6: return "MODERATE","#F4A261"
-    if s<8: return "HIGH","#E76F51"
-    return "CRITICAL","#C1121F"
+DB_PATH = Path("saferoute.db")
 
-EMA=[
-    {"id":"fatigue","dom":"Fatigue","q":"How tired are you right now?","t":"slider","max":10},
-    {"id":"stress","dom":"Stress","q":"Rate your current stress level.","t":"slider","max":100},
-    {"id":"safety","dom":"Perceived Safety","q":"How safe do you feel right now?","t":"lik","o":["Very unsafe","Unsafe","Neutral","Safe","Very safe"]},
-    {"id":"dist","dom":"Distraction","q":"Were you using your phone while walking?","t":"lik","o":["Yes","Partially","No"]},
-    {"id":"fam","dom":"Familiarity","q":"How familiar are you with this area?","t":"lik","o":["Not at all","Slightly","Somewhat","Mostly","Very well"]},
-    {"id":"nm","dom":"Near-miss","q":"Did anything almost happen just now?","t":"yn"},
-    {"id":"cult","dom":"Cultural","q":"Do local traffic norms confuse you?","t":"lik","o":["Not at all","Slightly","Somewhat","Quite","Very much"]},
-    {"id":"acad","dom":"Academic stress","q":"How stressed are you about your studies today?","t":"lik","o":["None","Low","Moderate","High","Extreme"]},
+COLORS = {
+    "bg":        "#0D1117",
+    "surface":   "#161B22",
+    "surface2":  "#21262D",
+    "border":    "#30363D",
+    "primary":   "#00D4AA",
+    "warning":   "#F4A261",
+    "danger":    "#E76F51",
+    "critical":  "#C1121F",
+    "text":      "#E6EDF3",
+    "text_dim":  "#7D8590",
+}
+
+RISK_TIERS = [
+    (0.0, 3.0,  "LOW",      "#00D4AA"),
+    (3.0, 6.0,  "MODERATE", "#F4A261"),
+    (6.0, 8.0,  "HIGH",     "#E76F51"),
+    (8.0, 10.1, "CRITICAL", "#C1121F"),
 ]
 
-# ══ DATABASE ═══════════════════════════════════════════════════
+def get_tier(score):
+    for lo, hi, label, color in RISK_TIERS:
+        if lo <= score < hi:
+            return label, color
+    return "LOW", "#00D4AA"
+
+EMA_QUESTIONS = [
+    {"id": "fatigue",   "domain": "Fatigue",         "text": "How tired are you right now?",                    "type": "slider", "max": 10},
+    {"id": "stress",    "domain": "Stress",           "text": "Rate your current stress level.",                 "type": "slider", "max": 100},
+    {"id": "safety",    "domain": "Perceived Safety", "text": "How safe do you feel right now?",                 "type": "likert", "opts": ["Very unsafe","Unsafe","Neutral","Safe","Very safe"]},
+    {"id": "distract",  "domain": "Distraction",      "text": "Were you using your phone while walking?",        "type": "choice", "opts": ["Yes","Partially","No"]},
+    {"id": "familiar",  "domain": "Familiarity",      "text": "How familiar are you with this area?",            "type": "likert", "opts": ["Not at all","Slightly","Somewhat","Mostly","Very well"]},
+    {"id": "nearmiss",  "domain": "Near-miss",        "text": "Did anything almost happen just now?",            "type": "yesno"},
+    {"id": "cultural",  "domain": "Cultural",         "text": "Do local traffic norms confuse you right now?",   "type": "likert", "opts": ["Not at all","Slightly","Somewhat","Quite","Very much"]},
+    {"id": "academic",  "domain": "Academic stress",  "text": "How stressed are you about your studies today?",  "type": "likert", "opts": ["None","Low","Moderate","High","Extreme"]},
+]
+
+# ══════════════════════════════════════════════════════════════════
+# DATABASE
+# ══════════════════════════════════════════════════════════════════
+
 def init_db():
-    conn=sqlite3.connect(DB)
+    conn = sqlite3.connect(DB_PATH)
     conn.executescript("""
-        CREATE TABLE IF NOT EXISTS ema(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,ans TEXT);
-        CREATE TABLE IF NOT EXISTS risk(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,score REAL,tier TEXT,fatigue REAL,stress REAL,familiarity REAL,distraction TEXT,cultural REAL,near_miss INTEGER);
-        CREATE TABLE IF NOT EXISTS profile(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,full_name TEXT,country TEXT,university TEXT,years_in_china TEXT,academic_level TEXT,transport TEXT,housing TEXT);
+        CREATE TABLE IF NOT EXISTS ema_responses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT, answers TEXT
+        );
+        CREATE TABLE IF NOT EXISTS risk_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT, score REAL, tier TEXT,
+            fatigue INTEGER, stress INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS gps_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT, lat REAL, lng REAL, speed REAL, mode TEXT
+        );
     """)
-    conn.commit();conn.close()
-
-def db_save_ema(ans):
-    conn=sqlite3.connect(DB)
-    conn.execute("INSERT INTO ema(ts,ans)VALUES(?,?)",(datetime.now().isoformat(),json.dumps(ans)))
-    conn.commit();conn.close()
-
-def db_save_risk(score,t,fat=0,str_=0,fam=4,dist="no",cult=1,nm=0):
-    conn=sqlite3.connect(DB)
-    conn.execute("INSERT INTO risk(ts,score,tier,fatigue,stress,familiarity,distraction,cultural,near_miss)VALUES(?,?,?,?,?,?,?,?,?)",
-                 (datetime.now().isoformat(),score,t,fat,str_,fam,dist,cult,nm))
-    conn.commit();conn.close()
-
-def db_save_profile(data):
-    conn=sqlite3.connect(DB)
-    # Delete old entries for same name to prevent duplicates
-    conn.execute("DELETE FROM profile WHERE full_name=?",(data.get("name",""),))
-    conn.execute("INSERT INTO profile(ts,full_name,country,university,years_in_china,academic_level,transport,housing)VALUES(?,?,?,?,?,?,?,?)",
-                 (datetime.now().isoformat(),data.get("name",""),data.get("country",""),
-                  data.get("university",""),data.get("years",""),data.get("level",""),
-                  data.get("transport",""),data.get("housing","")))
-    conn.commit();conn.close()
-
-def db_load_profile():
-    conn=sqlite3.connect(DB)
-    row=conn.execute("SELECT full_name,country,university,years_in_china,academic_level,transport,housing FROM profile ORDER BY id DESC LIMIT 1").fetchone()
+    conn.commit()
     conn.close()
-    if row: return {"name":row[0],"country":row[1],"university":row[2],"years":row[3],"level":row[4],"transport":row[5],"housing":row[6]}
-    return {}
 
-def db_last_ema():
-    conn=sqlite3.connect(DB)
-    row=conn.execute("SELECT ans,ts FROM ema ORDER BY id DESC LIMIT 1").fetchone()
+def save_ema(answers: dict):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT INTO ema_responses (timestamp, answers) VALUES (?,?)",
+                 (datetime.now().isoformat(), json.dumps(answers)))
+    conn.commit(); conn.close()
+
+def save_risk(score, tier, fatigue=0, stress=0):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT INTO risk_scores (timestamp,score,tier,fatigue,stress) VALUES (?,?,?,?,?)",
+                 (datetime.now().isoformat(), score, tier, fatigue, stress))
+    conn.commit(); conn.close()
+
+def get_risk_history(limit=20):
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT timestamp,score,tier FROM risk_scores ORDER BY id DESC LIMIT ?",
+                        (limit,)).fetchall()
     conn.close()
-    if row:
-        try: return json.loads(row[0]),row[1]
-        except: pass
-    return {},None
+    return rows
 
-def db_history(n=25):
-    conn=sqlite3.connect(DB)
-    rows=conn.execute("SELECT ts,score,tier FROM risk ORDER BY id DESC LIMIT ?",(n,)).fetchall()
-    conn.close();return rows
-
-def db_stats():
-    conn=sqlite3.connect(DB)
-    n1=conn.execute("SELECT COUNT(*) FROM ema").fetchone()[0]
-    n2=conn.execute("SELECT COUNT(*) FROM risk").fetchone()[0]
-    av=conn.execute("SELECT AVG(score) FROM risk").fetchone()[0]
-    conn.close();return n1,n2,round(av or 0.0,1)
-
-def db_minutes_since_last_ema():
-    conn=sqlite3.connect(DB)
-    row=conn.execute("SELECT ts FROM ema ORDER BY id DESC LIMIT 1").fetchone()
+def get_stats():
+    conn = sqlite3.connect(DB_PATH)
+    n_ema  = conn.execute("SELECT COUNT(*) FROM ema_responses").fetchone()[0]
+    n_risk = conn.execute("SELECT COUNT(*) FROM risk_scores").fetchone()[0]
+    avg    = conn.execute("SELECT AVG(score) FROM risk_scores").fetchone()[0]
     conn.close()
-    if not row: return 9999
-    try:
-        last=datetime.fromisoformat(row[0])
-        return (datetime.now()-last).total_seconds()/60
-    except: return 9999
+    return n_ema, n_risk, round(avg or 0, 1)
 
-# ══ SENSOR ENGINE (reads from last EMA) ════════════════════════
-class Sensor:
+# ══════════════════════════════════════════════════════════════════
+# SIMULATED SENSORS (replace with real platform APIs)
+# ══════════════════════════════════════════════════════════════════
+
+class SensorEngine:
+    """Simulates GPS + accelerometer + risk scoring in background thread."""
     def __init__(self):
-        self.risk=2.1;self.fat=3;self.str_=25;self.fam=4
-        self.night=False;self.rain=False;self.mode="walking"
-        self.spd=1.2;self.min=0.0;self._on=False
-        self.dist="no";self.cult=1;self.nm=0
+        self.lat       = 28.1826
+        self.lng       = 112.9346
+        self.speed     = 1.2
+        self.mode      = "walking"
+        self.risk      = 2.1
+        self.fatigue   = 3
+        self.stress    = 25
+        self.raining   = False
+        self.night     = False
+        self.familiar  = 4
+        self.trip_min  = 0
+        self._running  = False
+        self._callbacks = []
 
     def start(self):
-        self._on=True;threading.Thread(target=self._loop,daemon=True).start()
+        self._running = True
+        threading.Thread(target=self._loop, daemon=True).start()
 
-    def update_from_ema(self,ans):
-        """Update sensor state from latest EMA response"""
-        if "fatigue" in ans:   self.fat   = int(ans["fatigue"])
-        if "stress"  in ans:   self.str_  = int(ans["stress"])
-        if "fam"     in ans:   self.fam   = int(ans["fam"])+1
-        if "dist"    in ans:   self.dist  = ans["dist"]
-        if "cult"    in ans:   self.cult  = int(ans["cult"])+1
-        if "nm"      in ans:   self.nm    = 1 if ans["nm"]=="yes" else 0
+    def stop(self):
+        self._running = False
+
+    def add_callback(self, fn):
+        self._callbacks.append(fn)
 
     def _loop(self):
-        while self._on:
-            # Load latest EMA every cycle
-            ans,_ = db_last_ema()
-            if ans: self.update_from_ema(ans)
+        while self._running:
+            # Drift position
+            self.lat  += random.uniform(-0.0001, 0.0001)
+            self.lng  += random.uniform(-0.0001, 0.0001)
+            self.speed = abs(random.gauss(1.3, 0.4))
+            self.mode  = "walking" if self.speed < 2 else "cycling" if self.speed < 8 else "vehicle"
+            self.trip_min += 5/60
 
-            self.spd=abs(random.gauss(1.3,0.4))
-            self.mode="walking" if self.spd<2 else "cycling" if self.spd<8 else "vehicle"
-            self.min+=5/60
-
-            # Check if night (22:00-06:00)
-            h=datetime.now().hour
-            self.night = h>=22 or h<=6
-
-            # Compute risk from real EMA values
-            base=(
-                self.fat*0.35 +
-                self.str_/100*2.5 +
-                (6-self.fam)*0.50 +
+            # Recompute risk score
+            base = (
+                self.fatigue * 0.30 +
+                self.stress / 100 * 2.0 +
+                (6 - self.familiar) * 0.40 +
                 (1.5 if self.night else 0) +
-                (1.0 if self.rain  else 0) +
-                (1.5 if self.nm    else 0) +
-                (self.cult-1)*0.30 +
-                (1.2 if self.dist=="yes" else 0.5 if self.dist=="partially" else 0) +
-                random.gauss(0,0.4)
+                (1.0 if self.raining else 0) +
+                random.gauss(0, 0.3)
             )
-            self.risk=round(max(0.0,min(10.0,base)),1)
-            t,_=tier(self.risk)
-            db_save_risk(self.risk,t,self.fat,self.str_,self.fam,self.dist,self.cult,self.nm)
+            self.risk = round(max(0, min(10, base)), 1)
+            tier, _ = get_tier(self.risk)
+            save_risk(self.risk, tier, self.fatigue, self.stress)
+
+            for fn in self._callbacks:
+                try: fn()
+                except: pass
             time.sleep(5)
 
-S=Sensor()
+sensor = SensorEngine()
 
-# ══ UI ATOMS ═══════════════════════════════════════════════════
-def T(t,sz=14,col=None,bold=False,mono=False):
-    return ft.Text(t,size=sz,color=col or C["txt"],
-                   weight=ft.FontWeight.W_700 if bold else ft.FontWeight.W_400,
-                   font_family="monospace" if mono else None)
-def Dim(t,sz=12): return ft.Text(t,size=sz,color=C["dim"])
-def Card(content,bc=None,p=14):
-    return ft.Container(content=content,bgcolor=C["surf"],border_radius=12,
-                        padding=pad_all(p),border=border_all(1,bc or C["bord"]))
-def Badge(label,col):
-    return ft.Container(content=ft.Text(label,size=10,weight=ft.FontWeight.W_700,color=col),
-                        padding=pad(10,10,3,3),border_radius=20,
-                        bgcolor=col+"22",border=border_all(1,col+"55"))
-def Btn(label,col,on_click,width=None):
-    return ft.Button(label,bgcolor=col,color="#000000",width=width,on_click=on_click,
-                     style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=10)))
-def GhostBtn(label,on_click):
-    return ft.OutlinedButton(label,on_click=on_click,
-                             style=ft.ButtonStyle(color=C["dim"],side=ft.BorderSide(1,C["bord"])))
+# ══════════════════════════════════════════════════════════════════
+# UI HELPERS
+# ══════════════════════════════════════════════════════════════════
 
-# ══ EMA REMINDER POPUP ═════════════════════════════════════════
-def show_ema_reminder(page,navigate):
-    """Show full-screen EMA reminder that must be dismissed"""
-    mins=db_minutes_since_last_ema()
-    if mins < 30: return  # Don't show if survey done < 30 min ago
-
-    def go_survey(e):
-        page.dialog.open=False
-        page.update()
-        navigate("ema")
-
-    def remind_later(e):
-        page.dialog.open=False
-        page.update()
-
-    page.dialog=ft.AlertDialog(
-        modal=True,
-        bgcolor=C["surf"],
-        title=ft.Text("⏰ Time for your EMA Survey",
-                      size=18,weight=ft.FontWeight.W_700,color=C["warn"]),
-        content=ft.Column(spacing=12,tight=True,controls=[
-            ft.Text("You haven't completed a survey in the last 30 minutes.",
-                    size=14,color=C["txt"]),
-            ft.Text("Your response helps track your real risk factors accurately.",
-                    size=13,color=C["dim"]),
-            ft.Container(
-                padding=pad_all(12),border_radius=8,
-                bgcolor=C["warn"]+"18",border=border_all(1,C["warn"]+"44"),
-                content=ft.Text(
-                    f"Last survey: {int(mins)} min ago" if mins<9999 else "No survey completed yet",
-                    size=12,color=C["warn"])),
-        ]),
-        actions=[
-            ft.TextButton("Remind me later",on_click=remind_later,
-                          style=ft.ButtonStyle(color=C["dim"])),
-            ft.Button("Start Survey Now",bgcolor=C["warn"],color="#000",
-                      on_click=go_survey,
-                      style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8))),
-        ],
-        actions_alignment=ft.MainAxisAlignment.END,
+def card(content, padding=16, border_color=None):
+    return ft.Container(
+        content=content,
+        bgcolor=COLORS["surface"],
+        border_radius=12,
+        padding=padding,
+        border=ft.border.all(1, border_color or COLORS["border"]),
     )
-    page.dialog.open=True
-    page.update()
 
-# ══ DASHBOARD ══════════════════════════════════════════════════
-def dashboard(page,navigate):
-    sc=S.risk;t,col=tier(sc)
-    now=datetime.now().strftime("%H:%M · %d %b %Y")
-    ans,last_ts=db_last_ema()
-    mins=db_minutes_since_last_ema()
+def label(text, size=11, color=None, bold=False):
+    return ft.Text(text, size=size, color=color or COLORS["text_dim"],
+                   weight=ft.FontWeight.W_600 if bold else ft.FontWeight.W_400)
 
-    ring=ft.Stack(width=180,height=180,controls=[
-        ft.Container(width=180,height=180,border_radius=90,border=border_all(6,col+"33")),
-        ft.Container(width=148,height=148,border_radius=74,margin=mar_all(16),
-                     bgcolor=col+"18",border=border_all(2.5,col),
-                     content=ft.Column(alignment=ft.MainAxisAlignment.CENTER,
-                                       horizontal_alignment=ft.CrossAxisAlignment.CENTER,spacing=2,
-                                       controls=[T(f"{sc:.1f}",sz=44,col=col,bold=True,mono=True),
-                                                 Dim("/ 10.0"),ft.Container(height=4),Badge(t,col)]))])
+def heading(text, size=16):
+    return ft.Text(text, size=size, weight=ft.FontWeight.W_700, color=COLORS["text"])
 
-    factors=[
-        ("Fatigue",    S.fat/10,                              C["dang"]),
-        ("Stress",     S.str_/100,                            C["warn"]),
-        ("Familiarity",1-(S.fam-1)/4,                        C["pri"]),
-        ("Night",      1.0 if S.night else 0.05,             "#7B68EE"),
-        ("Near-miss",  1.0 if S.nm else 0.05,                C["crit"]),
+def tier_badge(tier, color):
+    return ft.Container(
+        content=ft.Text(tier, size=10, weight=ft.FontWeight.W_700, color=color),
+        padding=ft.padding.symmetric(horizontal=10, vertical=3),
+        border_radius=20,
+        bgcolor=color + "22",
+        border=ft.border.all(1, color + "55"),
+    )
+
+# ══════════════════════════════════════════════════════════════════
+# SCREEN 1: DASHBOARD
+# ══════════════════════════════════════════════════════════════════
+
+def build_dashboard(page: ft.Page, navigate):
+    score  = sensor.risk
+    tier, color = get_tier(score)
+    now    = datetime.now().strftime("%H:%M · %d %b %Y")
+
+    # ── Risk ring ─────────────────────────────────────────────────
+    ring = ft.Stack(width=180, height=180, controls=[
+        ft.Container(width=180, height=180, border_radius=90,
+                     border=ft.border.all(6, color + "33")),
+        ft.Container(
+            width=148, height=148, border_radius=74,
+            margin=ft.margin.all(16),
+            bgcolor=color + "18",
+            border=ft.border.all(2.5, color),
+            content=ft.Column(
+                alignment=ft.MainAxisAlignment.CENTER,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=0,
+                controls=[
+                    ft.Text(f"{score:.1f}", size=44, weight=ft.FontWeight.W_700,
+                            color=color, font_family="monospace"),
+                    ft.Text("/ 10.0", size=11, color=COLORS["text_dim"]),
+                    ft.Container(height=4),
+                    tier_badge(tier, color),
+                ],
+            ),
+        ),
+    ])
+
+    # ── Factor bars ───────────────────────────────────────────────
+    factors = [
+        ("Fatigue",     sensor.fatigue / 10, COLORS["danger"]),
+        ("Stress",      sensor.stress / 100,  COLORS["warning"]),
+        ("Familiarity", 1 - (sensor.familiar - 1) / 4, COLORS["primary"]),
+        ("Nighttime",   1.0 if sensor.night else 0.1, "#7B68EE"),
+        ("Rain",        1.0 if sensor.raining else 0.1, "#4A9EFF"),
     ]
-    def fbar(name,val,fc):
-        return ft.Column(spacing=3,controls=[
-            ft.Row(controls=[ft.Text(name,size=12,color=C["dim"],expand=True),
-                             ft.Text(f"{val*10:.1f}",size=12,color=fc,font_family="monospace")]),
-            ft.Container(height=5,border_radius=3,bgcolor=C["surf2"],
-                         content=ft.Container(width=max(4.0,280.0*float(val)),
-                                              height=5,border_radius=3,bgcolor=fc))])
 
-    nudge_map={"HIGH":"⚠  Multiple risks. Slow down and stay alert.",
-               "CRITICAL":"🚨  Critical risk. Stop and find safety now."}
-    nudge=ft.Container(visible=t in nudge_map,padding=pad_all(14),border_radius=12,
-                       bgcolor=col+"18",border=border_all(1.5,col+"66"),
-                       content=ft.Text(nudge_map.get(t,""),size=13,color=col))
+    def factor_row(name, val, c):
+        return ft.Column(spacing=4, controls=[
+            ft.Row(controls=[
+                ft.Text(name, size=12, color=COLORS["text_dim"], expand=True),
+                ft.Text(f"{val*10:.1f}", size=12, color=c, font_family="monospace"),
+            ]),
+            ft.Container(
+                height=5, border_radius=3, bgcolor=COLORS["surface2"],
+                content=ft.Container(
+                    width=200 * val, height=5, border_radius=3, bgcolor=c,
+                ),
+            ),
+        ])
 
-    sym={"walking":"🚶","cycling":"🚴","vehicle":"🚗"}.get(S.mode,"🚶")
+    # ── Trip card ─────────────────────────────────────────────────
+    mode_icon = {"walking": ft.icons.DIRECTIONS_WALK,
+                 "cycling": ft.icons.DIRECTIONS_BIKE,
+                 "vehicle": ft.icons.DIRECTIONS_CAR}.get(sensor.mode, ft.icons.DIRECTIONS_WALK)
 
-    # EMA status card — red if overdue
-    ema_overdue = mins > 30
-    ema_col = C["dang"] if ema_overdue else C["warn"]
-    ema_msg  = f"⚠ Overdue! Last survey {int(mins)} min ago" if ema_overdue else \
-               f"Last survey {int(mins)} min ago" if mins<9999 else "No survey yet — please start!"
+    trip_card = card(ft.Row(controls=[
+        ft.Icon(mode_icon, color=COLORS["primary"], size=22),
+        ft.Column(spacing=2, expand=True, controls=[
+            ft.Text("Trip in progress", size=13, weight=ft.FontWeight.W_600, color=COLORS["text"]),
+            ft.Text(f"{sensor.mode.capitalize()} · {sensor.trip_min:.0f} min · {sensor.speed:.1f} m/s",
+                    size=11, color=COLORS["text_dim"]),
+        ]),
+        ft.Container(width=8, height=8, border_radius=4, bgcolor=COLORS["primary"]),
+    ]), border_color=COLORS["primary"] + "44")
 
-    return ft.Container(expand=True,bgcolor=C["bg"],padding=pad_hv(18,16),
-        content=ft.Column(scroll=ft.ScrollMode.AUTO,spacing=14,controls=[
-            ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN,controls=[
-                ft.Column(spacing=2,controls=[T("SafeRoute",sz=22,bold=True),Dim(now)]),
-                ft.IconButton(ft.Icons.NOTIFICATIONS,icon_color=C["dim"])]),
-            ft.Container(alignment=CENTER,content=ring),
-            nudge,
-            Card(ft.Column(spacing=10,controls=[
-                T("Risk factors (from your last EMA)",sz=13,col=C["dim"],bold=True),
-                *[fbar(n,v,c) for n,v,c in factors]])),
-            Card(ft.Row(controls=[
-                ft.Text(sym,size=22),ft.Container(width=10),
-                ft.Column(spacing=2,expand=True,controls=[
-                    T("Trip in progress",sz=13,bold=True),
-                    Dim(f"{S.mode.capitalize()} · {S.min:.0f} min · {S.spd:.1f} m/s")]),
-                ft.Container(width=8,height=8,border_radius=4,bgcolor=C["pri"])]),
-                bc=C["pri"]+"44"),
-            Card(ft.Row(controls=[
-                ft.Text("📋",size=20),ft.Container(width=10),
-                ft.Column(spacing=2,expand=True,controls=[
-                    T("EMA Survey",sz=13,bold=True),
-                    ft.Text(ema_msg,size=11,color=ema_col)]),
-                ft.Button("Start",bgcolor=ema_col,color="#000",
-                          on_click=lambda _:navigate("ema"),
-                          style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)))]),
-                bc=ema_col+"44"),
-        ]))
+    # ── Nudge banner ──────────────────────────────────────────────
+    nudge_msgs = {
+        "HIGH":     "⚠  Multiple risks detected. Slow down and stay alert.",
+        "CRITICAL": "🚨  Critical risk. Stop, find a safe place, and wait.",
+    }
+    nudge = ft.Container(
+        visible=tier in nudge_msgs,
+        padding=ft.padding.all(14),
+        border_radius=12,
+        bgcolor=color + "18",
+        border=ft.border.all(1.5, color + "66"),
+        content=ft.Text(nudge_msgs.get(tier, ""), size=13, color=color),
+    )
 
-# ══ EMA SURVEY ═════════════════════════════════════════════════
-def ema_screen(page,navigate):
-    st={"q":0,"ans":{},"sv":5};col_ref=ft.Column(expand=True,spacing=16)
+    return ft.Container(
+        expand=True,
+        bgcolor=COLORS["bg"],
+        padding=ft.padding.symmetric(horizontal=18, vertical=16),
+        content=ft.Column(
+            scroll=ft.ScrollMode.AUTO,
+            spacing=14,
+            controls=[
+                ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[
+                    ft.Column(spacing=2, controls=[
+                        heading("SafeRoute", 22),
+                        label(now),
+                    ]),
+                    ft.IconButton(ft.icons.NOTIFICATIONS_NONE,
+                                  icon_color=COLORS["text_dim"]),
+                ]),
+                ft.Container(alignment=ft.alignment.center, content=ring),
+                nudge,
+                card(ft.Column(spacing=10, controls=[
+                    label("Active risk factors", bold=True),
+                    *[factor_row(n, v, c) for n, v, c in factors],
+                ])),
+                trip_card,
+                card(ft.Row(controls=[
+                    ft.Icon(ft.icons.ASSIGNMENT_OUTLINED, color=COLORS["warning"], size=20),
+                    ft.Column(spacing=1, expand=True, controls=[
+                        ft.Text("EMA Survey available", size=13,
+                                weight=ft.FontWeight.W_600, color=COLORS["text"]),
+                        label("Tap to complete your next survey"),
+                    ]),
+                    ft.TextButton("Start →",
+                                  on_click=lambda _: navigate("ema"),
+                                  style=ft.ButtonStyle(color=COLORS["warning"])),
+                ])),
+            ],
+        ),
+    )
+
+# ══════════════════════════════════════════════════════════════════
+# SCREEN 2: EMA SURVEY
+# ══════════════════════════════════════════════════════════════════
+
+def build_ema(page: ft.Page, navigate):
+    state = {"q": 0, "answers": {}, "slider_val": 5}
+
     def render():
-        q=EMA[st["q"]];idx=st["q"];tot=len(EMA);pct=(idx+1)/tot;col=C["pri"]
-        prog=ft.Column(spacing=4,controls=[
-            ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                   controls=[Dim(f"Q {idx+1}/{tot}"),ft.Text(f"{int(pct*100)}%",size=12,color=col)]),
-            ft.Container(height=3,border_radius=2,bgcolor=C["surf2"],
-                         content=ft.Container(width=max(8.0,340.0*pct),height=3,border_radius=2,bgcolor=col))])
-        pill=ft.Container(content=ft.Text(q["dom"],size=11,weight=ft.FontWeight.W_700,color=col),
-                          padding=pad(12,12,4,4),border_radius=20,bgcolor=col+"20",
-                          border=border_all(1,col+"44"))
-        if q["t"]=="slider":
-            vd=ft.Text(str(st["sv"]),size=36,weight=ft.FontWeight.W_700,color=col,font_family="monospace")
-            def onsl(e): st["sv"]=int(e.control.value);st["ans"][q["id"]]=st["sv"];vd.value=str(st["sv"]);page.update()
-            resp=ft.Column(spacing=10,controls=[
-                ft.Container(alignment=CENTER,content=vd),
-                ft.Slider(min=0,max=q["max"],value=float(st["sv"]),active_color=col,inactive_color=col+"30",on_change=onsl),
-                ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN,controls=[Dim("0"),Dim(str(q["max"]))])])
-        elif q["t"]=="lik":
-            sel=st["ans"].get(q["id"]);opts=[]
-            for i,o in enumerate(q["o"]):
-                is_s=sel==i
-                def pick(e,i_=i,qid=q["id"]): st["ans"][qid]=i_;render()
-                opts.append(ft.Container(padding=pad_all(12),border_radius=10,
-                    bgcolor=col+"22" if is_s else C["surf2"],
-                    border=border_all(1.5 if is_s else 1,col if is_s else C["bord"]),
-                    on_click=pick,
-                    content=ft.Row(spacing=12,controls=[
-                        ft.Container(width=18,height=18,border_radius=9,
-                                     bgcolor=col if is_s else "transparent",
-                                     border=border_all(1.5,col if is_s else C["bord"])),
-                        ft.Text(o,size=14,color=C["txt"] if is_s else C["dim"])])))
-            resp=ft.Column(spacing=8,controls=opts)
-        elif q["t"]=="yn":
-            sel=st["ans"].get(q["id"])
-            def yes(e): st["ans"][q["id"]]="yes";render()
-            def no(e):  st["ans"][q["id"]]="no"; render()
-            resp=ft.Row(spacing=12,controls=[
-                Btn("Yes",col if sel=="yes" else C["surf2"],yes),
-                Btn("No", col if sel=="no"  else C["surf2"],no)])
-        else: resp=ft.Container()
-        def back(e): st["q"]=max(0,st["q"]-1);st["sv"]=5;render()
-        def nxt(e):
-            if st["q"]<tot-1: st["q"]+=1;st["sv"]=5;render()
+        q   = EMA_QUESTIONS[state["q"]]
+        idx = state["q"]
+        tot = len(EMA_QUESTIONS)
+        color = COLORS["primary"]
+
+        # Progress
+        pct = (idx + 1) / tot
+        progress = ft.Column(spacing=4, controls=[
+            ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[
+                label(f"Question {idx+1} of {tot}"),
+                label(f"{int(pct*100)}%", color=color),
+            ]),
+            ft.Container(height=3, border_radius=2, bgcolor=COLORS["surface2"],
+                         content=ft.Container(
+                             width=330 * pct, height=3, border_radius=2, bgcolor=color)),
+        ])
+
+        domain_badge = ft.Container(
+            padding=ft.padding.symmetric(horizontal=12, vertical=4),
+            border_radius=20, bgcolor=color + "20",
+            border=ft.border.all(1, color + "44"),
+            content=label(q["domain"], color=color, bold=True),
+        )
+
+        qtext = ft.Text(q["text"], size=19, weight=ft.FontWeight.W_600,
+                        color=COLORS["text"])
+
+        # Build response widget
+        if q["type"] == "slider":
+            val_text = ft.Text(str(state["slider_val"]), size=34,
+                               weight=ft.FontWeight.W_700, color=color,
+                               font_family="monospace")
+            def on_slide(e):
+                state["slider_val"] = int(e.control.value)
+                state["answers"][q["id"]] = state["slider_val"]
+                val_text.value = str(state["slider_val"])
+                page.update()
+
+            response = ft.Column(spacing=12, controls=[
+                ft.Container(alignment=ft.alignment.center, content=val_text),
+                ft.Slider(min=0, max=q["max"], value=state["slider_val"],
+                          active_color=color, inactive_color=color + "30",
+                          on_change=on_slide),
+                ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[
+                    label("0"), label(str(q["max"])),
+                ]),
+            ])
+
+        elif q["type"] in ("likert", "choice"):
+            sel = state["answers"].get(q["id"])
+            opts = []
+            for i, opt in enumerate(q["opts"]):
+                is_sel = sel == i
+                def on_pick(e, idx_=i, qid=q["id"]):
+                    state["answers"][qid] = idx_
+                    page.update()
+                opts.append(ft.Container(
+                    padding=ft.padding.all(13),
+                    border_radius=10,
+                    bgcolor=color + "22" if is_sel else COLORS["surface2"],
+                    border=ft.border.all(1.5 if is_sel else 1,
+                                         color if is_sel else COLORS["border"]),
+                    on_click=on_pick,
+                    content=ft.Row(spacing=12, controls=[
+                        ft.Container(width=18, height=18, border_radius=9,
+                                     bgcolor=color if is_sel else "transparent",
+                                     border=ft.border.all(1.5, color if is_sel
+                                                          else COLORS["border"])),
+                        ft.Text(opt, size=14,
+                                color=COLORS["text"] if is_sel else COLORS["text_dim"]),
+                    ]),
+                ))
+            response = ft.Column(spacing=8, controls=opts)
+
+        elif q["type"] == "yesno":
+            sel = state["answers"].get(q["id"])
+            def pick_yes(e): state["answers"][q["id"]] = "yes"; page.update()
+            def pick_no(e):  state["answers"][q["id"]] = "no";  page.update()
+            response = ft.Row(spacing=12, controls=[
+                ft.ElevatedButton("Yes", bgcolor=color if sel=="yes" else COLORS["surface2"],
+                                  color="#000" if sel=="yes" else COLORS["text_dim"],
+                                  on_click=pick_yes,
+                                  style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=10))),
+                ft.ElevatedButton("No",  bgcolor=color if sel=="no"  else COLORS["surface2"],
+                                  color="#000" if sel=="no"  else COLORS["text_dim"],
+                                  on_click=pick_no,
+                                  style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=10))),
+            ])
+        else:
+            response = ft.Text("N/A", color=COLORS["text_dim"])
+
+        # Nav buttons
+        def go_back(e):
+            state["q"] = max(0, state["q"] - 1)
+            state["slider_val"] = 5
+            page.update()
+
+        def go_next(e):
+            if state["q"] < len(EMA_QUESTIONS) - 1:
+                state["q"] += 1
+                state["slider_val"] = 5
+                page.update()
             else:
-                db_save_ema(st["ans"])
-                # Update sensor immediately
-                S.update_from_ema(st["ans"])
-                page.snack_bar=ft.SnackBar(
-                    content=ft.Text("Survey submitted ✓ Risk score updated!",color="#000"),
-                    bgcolor=C["pri"])
-                page.snack_bar.open=True
-                st["q"]=0;st["ans"]={};st["sv"]=5;navigate("dashboard")
-        col_ref.controls=[
-            ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                   controls=[T("EMA Survey",sz=20,bold=True),Dim(datetime.now().strftime("%H:%M"))]),
-            prog,ft.Container(height=4),pill,
-            T(q["q"],sz=17,bold=True),
-            ft.Container(expand=True,content=resp),
-            ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN,controls=[
-                GhostBtn("Back",back) if idx>0 else ft.Container(),
-                Btn("Submit ✓" if idx==tot-1 else "Next →",col,nxt)])]
+                save_ema(state["answers"])
+                page.snack_bar = ft.SnackBar(
+                    content=ft.Text("Survey submitted ✓", color="#000"),
+                    bgcolor=COLORS["primary"])
+                page.snack_bar.open = True
+                state["q"] = 0
+                state["answers"] = {}
+                state["slider_val"] = 5
+                navigate("dashboard")
+
+        nav = ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[
+            ft.OutlinedButton("← Back", visible=idx > 0, on_click=go_back,
+                              style=ft.ButtonStyle(color=COLORS["text_dim"],
+                                                   side=ft.BorderSide(1, COLORS["border"]))),
+            ft.ElevatedButton(
+                "Submit ✓" if idx == tot - 1 else "Next →",
+                bgcolor=color, color="#000",
+                on_click=go_next,
+                style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=10))),
+        ])
+
+        main_col.controls = [
+            ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[
+                heading("EMA Survey", 20),
+                label(datetime.now().strftime("%H:%M")),
+            ]),
+            progress,
+            ft.Container(height=6),
+            domain_badge,
+            qtext,
+            ft.Container(expand=True, content=response),
+            nav,
+        ]
         page.update()
+
+    main_col = ft.Column(expand=True, spacing=18)
     render()
-    return ft.Container(expand=True,bgcolor=C["bg"],padding=pad_hv(18,20),content=col_ref)
 
-# ══ HISTORY ════════════════════════════════════════════════════
-def history(page,navigate):
-    rows=db_history(30);n1,n2,av=db_stats();_,ac=tier(av)
-    def sc(val,lbl,col): return Card(ft.Column(spacing=2,
-        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-        controls=[T(str(val),sz=26,col=col,bold=True,mono=True),Dim(lbl)]),p=12)
-    body=[]
+    return ft.Container(
+        expand=True,
+        bgcolor=COLORS["bg"],
+        padding=ft.padding.symmetric(horizontal=18, vertical=20),
+        content=main_col,
+    )
+
+# ══════════════════════════════════════════════════════════════════
+# SCREEN 3: HISTORY
+# ══════════════════════════════════════════════════════════════════
+
+def build_history(page: ft.Page, navigate):
+    rows = get_risk_history(30)
+    n_ema, n_risk, avg_score = get_stats()
+    _, avg_color = get_tier(avg_score)
+
+    stat_cards = ft.Row(spacing=10, controls=[
+        card(ft.Column(spacing=2, horizontal_alignment=ft.CrossAxisAlignment.CENTER, controls=[
+            ft.Text(str(n_ema), size=28, weight=ft.FontWeight.W_700, color=COLORS["primary"]),
+            label("EMA surveys"),
+        ]), padding=12),
+        card(ft.Column(spacing=2, horizontal_alignment=ft.CrossAxisAlignment.CENTER, controls=[
+            ft.Text(str(n_risk), size=28, weight=ft.FontWeight.W_700, color=COLORS["warning"]),
+            label("Risk readings"),
+        ]), padding=12),
+        card(ft.Column(spacing=2, horizontal_alignment=ft.CrossAxisAlignment.CENTER, controls=[
+            ft.Text(f"{avg_score}", size=28, weight=ft.FontWeight.W_700, color=avg_color),
+            label("Avg risk score"),
+        ]), padding=12),
+    ])
+
     if not rows:
-        body=[ft.Container(height=180,alignment=CENTER,
-            content=ft.Column(alignment=ft.MainAxisAlignment.CENTER,
-                              horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                              controls=[ft.Text("No data yet",size=16,color=C["dim"])]))]
+        history_list = ft.Container(
+            alignment=ft.alignment.center,
+            height=200,
+            content=ft.Column(
+                alignment=ft.MainAxisAlignment.CENTER,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.Icon(ft.icons.HISTORY, color=COLORS["text_dim"], size=40),
+                    ft.Container(height=8),
+                    label("No history yet. Start the app to collect data."),
+                ],
+            ),
+        )
     else:
-        for ts,score,t in rows:
-            _,col=tier(score)
-            try: ds=datetime.fromisoformat(ts).strftime("%d %b  %H:%M")
-            except: ds=ts[:16]
-            body.append(ft.Container(padding=pad(14,14,10,10),border_radius=8,bgcolor=C["surf2"],
+        items = []
+        for ts, score, tier in rows:
+            _, c = get_tier(score)
+            try:
+                dt = datetime.fromisoformat(ts)
+                ts_str = dt.strftime("%d %b %H:%M")
+            except:
+                ts_str = ts[:16]
+            items.append(ft.Container(
+                padding=ft.padding.symmetric(horizontal=14, vertical=10),
+                border_radius=8,
+                bgcolor=COLORS["surface2"],
                 content=ft.Row(controls=[
-                    ft.Container(width=4,height=36,border_radius=2,bgcolor=col),ft.Container(width=10),
-                    ft.Column(spacing=2,expand=True,controls=[
-                        ft.Text(ds,size=12,color=C["txt"]),
-                        ft.Text(t,size=11,color=col,weight=ft.FontWeight.W_600)]),
-                    T(f"{score:.1f}",sz=22,col=col,bold=True,mono=True)])))
-    return ft.Container(expand=True,bgcolor=C["bg"],padding=pad_hv(18,16),
-        content=ft.Column(scroll=ft.ScrollMode.AUTO,spacing=14,controls=[
-            T("History",sz=22,bold=True),
-            ft.Row(spacing=10,controls=[sc(n1,"EMA",C["pri"]),sc(n2,"Readings",C["warn"]),sc(av,"Avg",ac)]),
-            T("Recent readings",sz=13,col=C["dim"],bold=True),
-            ft.Column(spacing=8,controls=body)]))
+                    ft.Container(width=4, height=36, border_radius=2, bgcolor=c),
+                    ft.Container(width=10),
+                    ft.Column(spacing=2, expand=True, controls=[
+                        ft.Text(ts_str, size=12, color=COLORS["text"]),
+                        label(tier, color=c),
+                    ]),
+                    ft.Text(f"{score:.1f}", size=22, weight=ft.FontWeight.W_700,
+                            color=c, font_family="monospace"),
+                ]),
+            ))
+        history_list = ft.Column(spacing=8, controls=items)
 
-# ══ PROFILE ════════════════════════════════════════════════════
-def profile(page,navigate):
-    existing=db_load_profile()
-    f_name=ft.TextField(hint_text="e.g. Kwame Mensah",value=existing.get("name",""),
-        bgcolor=C["surf2"],border_color=C["bord"],focused_border_color=C["pri"],
-        color=C["txt"],hint_style=ft.TextStyle(color=C["dim"]),border_radius=8)
-    f_country=ft.TextField(hint_text="e.g. Nigeria",value=existing.get("country",""),
-        bgcolor=C["surf2"],border_color=C["bord"],focused_border_color=C["pri"],
-        color=C["txt"],hint_style=ft.TextStyle(color=C["dim"]),border_radius=8)
-    f_university=ft.TextField(hint_text="e.g. Central South University",value=existing.get("university",""),
-        bgcolor=C["surf2"],border_color=C["bord"],focused_border_color=C["pri"],
-        color=C["txt"],hint_style=ft.TextStyle(color=C["dim"]),border_radius=8)
-    f_years=ft.TextField(hint_text="e.g. 2.5",value=existing.get("years",""),
-        bgcolor=C["surf2"],border_color=C["bord"],focused_border_color=C["pri"],
-        color=C["txt"],hint_style=ft.TextStyle(color=C["dim"]),border_radius=8)
-    f_level=ft.Dropdown(value=existing.get("level",""),
-        options=[ft.dropdown.Option(o) for o in ["Undergraduate","Masters","PhD","Postdoc"]],
-        bgcolor=C["surf2"],border_color=C["bord"],focused_border_color=C["pri"],color=C["txt"],border_radius=8)
-    f_transport=ft.Dropdown(value=existing.get("transport",""),
-        options=[ft.dropdown.Option(o) for o in ["Walking","Cycling","Bus","E-scooter","Car"]],
-        bgcolor=C["surf2"],border_color=C["bord"],focused_border_color=C["pri"],color=C["txt"],border_radius=8)
-    f_housing=ft.Dropdown(value=existing.get("housing",""),
-        options=[ft.dropdown.Option(o) for o in ["On-campus","Off-campus"]],
-        bgcolor=C["surf2"],border_color=C["bord"],focused_border_color=C["pri"],color=C["txt"],border_radius=8)
-    status=ft.Text("",size=13,color=C["pri"])
+    return ft.Container(
+        expand=True,
+        bgcolor=COLORS["bg"],
+        padding=ft.padding.symmetric(horizontal=18, vertical=16),
+        content=ft.Column(
+            scroll=ft.ScrollMode.AUTO,
+            spacing=16,
+            controls=[
+                heading("History", 22),
+                stat_cards,
+                label("Recent risk readings", bold=True),
+                history_list,
+            ],
+        ),
+    )
+
+# ══════════════════════════════════════════════════════════════════
+# SCREEN 4: PROFILE
+# ══════════════════════════════════════════════════════════════════
+
+def build_profile(page: ft.Page, navigate):
+    fields = [
+        ("Name",              "e.g. Kwame Mensah",      False),
+        ("Country of origin", "e.g. Nigeria",            False),
+        ("University",        "e.g. Central South Univ.","False"),
+        ("Years in China",    "e.g. 2.5",               False),
+    ]
+    dropdowns = [
+        ("Academic level",   ["Undergraduate","Masters","PhD","Postdoc"]),
+        ("Transport mode",   ["Walking","Cycling","Bus","E-scooter","Car"]),
+        ("Housing",          ["On-campus","Off-campus"]),
+    ]
 
     def saved(e):
-        if not f_name.value or not f_country.value:
-            status.value="Please fill in at least Name and Country."
-            status.color=C["dang"];page.update();return
-        db_save_profile({"name":f_name.value,"country":f_country.value,
-                         "university":f_university.value,"years":f_years.value,
-                         "level":f_level.value or "","transport":f_transport.value or "",
-                         "housing":f_housing.value or ""})
-        status.value="✓ Profile saved!"
-        status.color=C["pri"]
-        page.snack_bar=ft.SnackBar(content=ft.Text("Profile saved ✓",color="#000"),bgcolor=C["pri"])
-        page.snack_bar.open=True;page.update()
-
-    def fc(lbl,widget):
-        return Card(ft.Column(spacing=8,controls=[T(lbl,sz=13,col=C["dim"],bold=True),widget]))
-
-    return ft.Container(expand=True,bgcolor=C["bg"],padding=pad_hv(18,16),
-        content=ft.Column(scroll=ft.ScrollMode.AUTO,spacing=12,controls=[
-            T("Profile",sz=22,bold=True),
-            Dim("Stored locally. Never shared without consent."),
-            fc("Full name",f_name),fc("Country of origin",f_country),
-            fc("University",f_university),fc("Years in China",f_years),
-            fc("Academic level",f_level),fc("Primary transport",f_transport),
-            fc("Housing",f_housing),status,
-            ft.Button("Save Profile",bgcolor=C["pri"],color="#000",width=float("inf"),
-                      on_click=saved,style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12))),
-            ft.Container(height=16)]))
-
-# ══ MAIN ═══════════════════════════════════════════════════════
-def main(page:ft.Page):
-    import os
-    init_db();S.start()
-    page.title="SafeRoute"
-    page.theme_mode=ft.ThemeMode.DARK
-    page.bgcolor=C["bg"];page.padding=0
-    page.window_width=390;page.window_height=820
-
-    content=ft.Container(expand=True)
-    nav_ref=ft.Ref[ft.NavigationBar]()
-    names=["dashboard","ema","history","profile"]
-    builders=[dashboard,ema_screen,history,profile]
-
-    def navigate(screen):
-        idx=names.index(screen) if screen in names else 0
-        content.content=builders[idx](page,navigate)
-        if nav_ref.current: nav_ref.current.selected_index=idx
+        page.snack_bar = ft.SnackBar(
+            content=ft.Text("Profile saved ✓", color="#000"),
+            bgcolor=COLORS["primary"])
+        page.snack_bar.open = True
         page.update()
 
-    def on_nav(e): navigate(names[e.control.selected_index])
+    inputs = [
+        card(ft.Column(spacing=12, controls=[
+            label(name, bold=True),
+            ft.TextField(hint_text=hint, bgcolor=COLORS["surface2"],
+                         border_color=COLORS["border"],
+                         focused_border_color=COLORS["primary"],
+                         color=COLORS["text"],
+                         hint_style=ft.TextStyle(color=COLORS["text_dim"]),
+                         border_radius=8),
+        ]))
+        for name, hint, _ in fields
+    ] + [
+        card(ft.Column(spacing=12, controls=[
+            label(name, bold=True),
+            ft.Dropdown(
+                options=[ft.dropdown.Option(o) for o in opts],
+                bgcolor=COLORS["surface2"],
+                border_color=COLORS["border"],
+                focused_border_color=COLORS["primary"],
+                color=COLORS["text"],
+                border_radius=8,
+            ),
+        ]))
+        for name, opts in dropdowns
+    ]
 
-    # Auto-refresh dashboard every 5s
+    return ft.Container(
+        expand=True,
+        bgcolor=COLORS["bg"],
+        padding=ft.padding.symmetric(horizontal=18, vertical=16),
+        content=ft.Column(
+            scroll=ft.ScrollMode.AUTO,
+            spacing=14,
+            controls=[
+                heading("Profile", 22),
+                label("This data is stored locally and never shared without consent."),
+                *inputs,
+                ft.ElevatedButton(
+                    "Save profile",
+                    bgcolor=COLORS["primary"], color="#000",
+                    width=float("inf"),
+                    on_click=saved,
+                    style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12)),
+                ),
+                ft.Container(height=10),
+            ],
+        ),
+    )
+
+# ══════════════════════════════════════════════════════════════════
+# MAIN APP
+# ══════════════════════════════════════════════════════════════════
+
+def main(page: ft.Page):
+    init_db()
+    sensor.start()
+
+    page.title        = "SafeRoute"
+    page.theme_mode   = ft.ThemeMode.DARK
+    page.bgcolor      = COLORS["bg"]
+    page.padding      = 0
+    page.window_width  = 390
+    page.window_height = 820
+
+    # ── Content area ──────────────────────────────────────────────
+    content = ft.Container(expand=True)
+    nav_bar = ft.Ref[ft.NavigationBar]()
+
+    def navigate(screen: str):
+        screens = {
+            "dashboard": build_dashboard,
+            "ema":       build_ema,
+            "history":   build_history,
+            "profile":   build_profile,
+        }
+        idx_map = {"dashboard": 0, "ema": 1, "history": 2, "profile": 3}
+        builder = screens.get(screen, build_dashboard)
+        content.content = builder(page, navigate)
+        if nav_bar.current:
+            nav_bar.current.selected_index = idx_map.get(screen, 0)
+        page.update()
+
+    def on_nav(e):
+        names = ["dashboard", "ema", "history", "profile"]
+        navigate(names[e.control.selected_index])
+
+    # ── Auto-refresh dashboard every 5s ──────────────────────────
     def auto_refresh():
         while True:
             time.sleep(5)
-            try:
-                if nav_ref.current and nav_ref.current.selected_index==0:
-                    content.content=dashboard(page,navigate);page.update()
-            except: pass
+            if nav_bar.current and nav_bar.current.selected_index == 0:
+                try:
+                    content.content = build_dashboard(page, navigate)
+                    page.update()
+                except:
+                    pass
+    threading.Thread(target=auto_refresh, daemon=True).start()
 
-    # EMA reminder every 30 min
-    def ema_reminder():
-        time.sleep(60)  # Wait 1 min before first check
-        while True:
-            try:
-                if nav_ref.current and nav_ref.current.selected_index==0:
-                    show_ema_reminder(page,navigate)
-            except: pass
-            time.sleep(1800)  # Check every 30 min
+    sensor.add_callback(lambda: None)  # hook for future live callbacks
 
-    threading.Thread(target=auto_refresh,daemon=True).start()
-    threading.Thread(target=ema_reminder,daemon=True).start()
+    page.add(ft.Column(
+        expand=True,
+        spacing=0,
+        controls=[
+            content,
+            ft.NavigationBar(
+                ref=nav_bar,
+                bgcolor=COLORS["surface"],
+                indicator_color=COLORS["primary"] + "22",
+                selected_index=0,
+                on_change=on_nav,
+                destinations=[
+                    ft.NavigationBarDestination(icon=ft.icons.SHIELD_OUTLINED,
+                                                selected_icon=ft.icons.SHIELD,
+                                                label="Dashboard"),
+                    ft.NavigationBarDestination(icon=ft.icons.ASSIGNMENT_OUTLINED,
+                                                selected_icon=ft.icons.ASSIGNMENT,
+                                                label="Survey"),
+                    ft.NavigationBarDestination(icon=ft.icons.HISTORY,
+                                                label="History"),
+                    ft.NavigationBarDestination(icon=ft.icons.PERSON_OUTLINE,
+                                                selected_icon=ft.icons.PERSON,
+                                                label="Profile"),
+                ],
+            ),
+        ],
+    ))
 
-    page.add(ft.Column(expand=True,spacing=0,controls=[
-        content,
-        ft.NavigationBar(ref=nav_ref,bgcolor=C["surf"],
-                         indicator_color=C["pri"]+"22",selected_index=0,on_change=on_nav,
-                         destinations=[
-                             ft.NavigationBarDestination(icon=ft.Icons.HOME,selected_icon=ft.Icons.HOME,label="Dashboard"),
-                             ft.NavigationBarDestination(icon=ft.Icons.EDIT,selected_icon=ft.Icons.EDIT,label="Survey"),
-                             ft.NavigationBarDestination(icon=ft.Icons.BAR_CHART,selected_icon=ft.Icons.BAR_CHART,label="History"),
-                             ft.NavigationBarDestination(icon=ft.Icons.PERSON,selected_icon=ft.Icons.PERSON,label="Profile"),
-                         ])]))
     navigate("dashboard")
 
-PORT=int(__import__('os').environ.get("PORT",8000))
-ft.app(target=main,view=ft.AppView.WEB_BROWSER,port=PORT,host="0.0.0.0")
+
+ft.app(target=main)
