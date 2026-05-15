@@ -1,4 +1,4 @@
-import flet as ft, threading, time, random, sqlite3, json
+﻿import flet as ft, threading, time, random, sqlite3, json
 from datetime import datetime
 from pathlib import Path
 
@@ -104,7 +104,7 @@ def GhostBtn(label,on_click):
     return ft.OutlinedButton(label,on_click=on_click,style=ft.ButtonStyle(color=C["dim"],side=ft.BorderSide(1,C["bord"])))
 
 def dashboard(page,nav):
-    sc=S.risk;t,col=tier(sc);now=datetime.now().strftime("%H:%M · %d %b %Y")
+    sc=S.risk;t,col=tier(sc);now=datetime.now().strftime("%H:%M Â· %d %b %Y")
     ring=ft.Stack(width=180,height=180,controls=[
         ft.Container(width=180,height=180,border_radius=90,border=border_all(6,col+"33")),
         ft.Container(width=148,height=148,border_radius=74,margin=mar_all(16),bgcolor=col+"18",border=border_all(2.5,col),
@@ -117,14 +117,14 @@ def dashboard(page,nav):
             ft.Container(height=5,border_radius=3,bgcolor=C["surf2"],content=ft.Container(width=max(4.0,280.0*float(val)),height=5,border_radius=3,bgcolor=fc))])
     nudge_map={"HIGH":"Multiple risks. Slow down.","CRITICAL":"Critical risk. Find safety."}
     nudge=ft.Container(visible=t in nudge_map,padding=pad_all(14),border_radius=12,bgcolor=col+"18",border=border_all(1.5,col+"66"),content=ft.Text(nudge_map.get(t,""),size=13,color=col))
-    sym={"walking":"🚶","cycling":"🚴","vehicle":"🚗"}.get(S.mode,"🚶")
+    sym={"walking":"ðŸš¶","cycling":"ðŸš´","vehicle":"ðŸš—"}.get(S.mode,"ðŸš¶")
     return ft.Container(expand=True,bgcolor=C["bg"],padding=pad_hv(18,16),
         content=ft.Column(scroll=ft.ScrollMode.AUTO,spacing=14,controls=[
             ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN,controls=[ft.Column(spacing=2,controls=[T("SafeRoute",sz=22,bold=True),Dim(now)]),ft.IconButton(ft.Icons.NOTIFICATIONS,icon_color=C["dim"])]),
             ft.Container(alignment=CENTER,content=ring),nudge,
             Card(ft.Column(spacing=10,controls=[T("Risk factors",sz=13,col=C["dim"],bold=True),*[fbar(n,v,c) for n,v,c in factors]])),
-            Card(ft.Row(controls=[ft.Text(sym,size=22),ft.Container(width=10),ft.Column(spacing=2,expand=True,controls=[T("Trip in progress",sz=13,bold=True),Dim(f"{S.mode.capitalize()} · {S.min:.0f} min · {S.spd:.1f} m/s")]),ft.Container(width=8,height=8,border_radius=4,bgcolor=C["pri"])]),bc=C["pri"]+"44"),
-            Card(ft.Row(controls=[ft.Text("📋",size=20),ft.Container(width=10),ft.Column(spacing=2,expand=True,controls=[T("EMA Survey available",sz=13,bold=True),Dim("Tap to complete your check-in")]),ft.TextButton("Start",on_click=lambda _:nav("ema"),style=ft.ButtonStyle(color=C["warn"]))])),
+            Card(ft.Row(controls=[ft.Text(sym,size=22),ft.Container(width=10),ft.Column(spacing=2,expand=True,controls=[T("Trip in progress",sz=13,bold=True),Dim(f"{S.mode.capitalize()} Â· {S.min:.0f} min Â· {S.spd:.1f} m/s")]),ft.Container(width=8,height=8,border_radius=4,bgcolor=C["pri"])]),bc=C["pri"]+"44"),
+            Card(ft.Row(controls=[ft.Text("ðŸ“‹",size=20),ft.Container(width=10),ft.Column(spacing=2,expand=True,controls=[T("EMA Survey available",sz=13,bold=True),Dim("Tap to complete your check-in")]),ft.TextButton("Start",on_click=lambda _:nav("ema"),style=ft.ButtonStyle(color=C["warn"]))])),
         ]))
 
 def ema_screen(page,nav):
@@ -156,7 +156,7 @@ def ema_screen(page,nav):
         def nxt(e):
             if st["q"]<tot-1: st["q"]+=1;st["sv"]=5;render()
             else:
-                db_save_ema(st["ans"]);page.snack_bar=ft.SnackBar(content=ft.Text("Survey submitted ✓",color="#000"),bgcolor=C["pri"]);page.snack_bar.open=True
+                db_save_ema(st["ans"]);page.snack_bar=ft.SnackBar(content=ft.Text("Survey submitted âœ“",color="#000"),bgcolor=C["pri"]);page.snack_bar.open=True
                 st["q"]=0;st["ans"]={};st["sv"]=5;nav("dashboard")
         col_ref.controls=[ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN,controls=[T("EMA Survey",sz=20,bold=True),Dim(datetime.now().strftime("%H:%M"))]),prog,ft.Container(height=4),pill,T(q["q"],sz=17,bold=True),ft.Container(expand=True,content=resp),ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN,controls=[GhostBtn("Back",back) if idx>0 else ft.Container(),Btn("Submit" if idx==tot-1 else "Next",col,nxt)])]
         page.update()
@@ -208,9 +208,9 @@ def profile(page,nav):
             "transport": f_transport.value or "",
             "housing":   f_housing.value or "",
         })
-        status.value="✓ Profile saved successfully!"
+        status.value="âœ“ Profile saved successfully!"
         status.color=C["pri"]
-        page.snack_bar=ft.SnackBar(content=ft.Text("Profile saved to database ✓",color="#000"),bgcolor=C["pri"])
+        page.snack_bar=ft.SnackBar(content=ft.Text("Profile saved to database âœ“",color="#000"),bgcolor=C["pri"])
         page.snack_bar.open=True
         page.update()
 
@@ -221,7 +221,7 @@ def profile(page,nav):
         visible=bool(existing),
         padding=pad_all(10),border_radius=8,
         bgcolor=C["pri"]+"18",border=border_all(1,C["pri"]+"44"),
-        content=ft.Text("Profile previously saved — shown below." if existing else "",size=12,color=C["pri"])
+        content=ft.Text("Profile previously saved â€” shown below." if existing else "",size=12,color=C["pri"])
     )
 
     return ft.Container(expand=True,bgcolor=C["bg"],padding=pad_hv(18,16),
@@ -261,4 +261,5 @@ def main(page:ft.Page):
     page.add(ft.Column(expand=True,spacing=0,controls=[content,ft.NavigationBar(ref=nav_ref,bgcolor=C["surf"],indicator_color=C["pri"]+"22",selected_index=0,on_change=on_nav,destinations=[ft.NavigationBarDestination(icon=ft.Icons.HOME,selected_icon=ft.Icons.HOME,label="Dashboard"),ft.NavigationBarDestination(icon=ft.Icons.EDIT,selected_icon=ft.Icons.EDIT,label="Survey"),ft.NavigationBarDestination(icon=ft.Icons.BAR_CHART,selected_icon=ft.Icons.BAR_CHART,label="History"),ft.NavigationBarDestination(icon=ft.Icons.PERSON,selected_icon=ft.Icons.PERSON,label="Profile")])]))
     navigate("dashboard")
 
-ft.app(target=main,view=ft.AppView.FLET_APP)
+import os; ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=int(os.environ.get("PORT", 8000)), host="0.0.0.0")
+
