@@ -1,2 +1,4 @@
-﻿flet==0.85.1
+flet==0.85.1
+flet-web==0.85.1
+fastapi==0.115.12
 openpyxl
