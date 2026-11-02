@@ -5,7 +5,8 @@ SafeRoute v5  -  Flet 0.85
   * Per-participant data (participant code), automatic DB migration,
     researcher Excel export from inside the app
 """
-import flet as ft, threading, time, random, sqlite3, json, os, uuid, glob
+import flet as ft, threading, time, random, sqlite3, json, os, uuid, glob, re, base64
+import urllib.request, urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -14,6 +15,13 @@ DB = Path(os.environ.get("DB_PATH", "saferoute.db"))
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")          # set on Render to enable export
 ASSETS = Path("assets")
 SENSOR_SECONDS = 10
+# --- optional SMS (Twilio). Leave unset = SMS switched off.
+TW_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TW_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TW_FROM = os.environ.get("TWILIO_FROM", "")           # your Twilio number, e.g. +1555...
+SMS_HOUR = int(os.environ.get("SMS_HOUR", "8"))       # daily reminder hour, local time
+TZ_OFFSET = int(os.environ.get("TZ_OFFSET_HOURS", "8"))  # 8 = China time
+EXPORT_SKIP = {"fb_contact"}                          # phone numbers never go in the Excel export
 
 # ══ LAYOUT HELPERS (Flet 0.85 safe) ════════════════════════════
 def border_all(w, c):
@@ -79,6 +87,8 @@ SCHEMA = {
                     "score": "REAL", "tier": "TEXT"},
     "fb_session": {"id": "INTEGER PRIMARY KEY AUTOINCREMENT", "pid": "TEXT", "ts": "TEXT",
                    "kind": "TEXT", "minutes": "REAL", "rpe": "REAL", "load": "REAL"},
+    "fb_contact": {"id": "INTEGER PRIMARY KEY AUTOINCREMENT", "pid": "TEXT", "ts": "TEXT",
+                   "phone": "TEXT", "consent": "TEXT", "last_sms_date": "TEXT"},
     "fb_injury": {"id": "INTEGER PRIMARY KEY AUTOINCREMENT", "pid": "TEXT", "ts": "TEXT",
                   "area": "TEXT", "context": "TEXT", "severity": "TEXT", "days_out": "INTEGER"},
 }
@@ -164,6 +174,53 @@ def fb_save_profile(pid, d):
     q_run("DELETE FROM fb_profile WHERE pid=?", (pid,))
     q_run("INSERT INTO fb_profile(pid,ts,age,position,level,prev_injury,weekly_sessions)VALUES(?,?,?,?,?,?,?)",
           (pid, now_iso(), d["age"], d["position"], d["level"], d["prev_injury"], d["weekly"]))
+
+PHONE_RE = re.compile(r"^\+\d{8,15}$")
+
+def fb_save_contact(pid, phone, consent):
+    q_run("DELETE FROM fb_contact WHERE pid=?", (pid,))
+    if phone and consent == "yes":
+        q_run("INSERT INTO fb_contact(pid,ts,phone,consent,last_sms_date)VALUES(?,?,?,?,?)",
+              (pid, now_iso(), phone, consent, ""))
+
+def fb_load_contact(pid):
+    r = q_one("SELECT phone,consent FROM fb_contact WHERE pid=? ORDER BY id DESC LIMIT 1", (pid,))
+    return {"phone": r[0], "consent": r[1]} if r else {}
+
+def send_sms(to, body):
+    """Send one text via Twilio. Returns True/False. Does nothing if Twilio is not configured."""
+    if not (TW_SID and TW_TOKEN and TW_FROM):
+        print("SMS not configured; would send to", to[:4] + "****", ":", body[:40]); return False
+    try:
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{TW_SID}/Messages.json"
+        data = urllib.parse.urlencode({"To": to, "From": TW_FROM, "Body": body}).encode()
+        req = urllib.request.Request(url, data=data)
+        req.add_header("Authorization", "Basic " + base64.b64encode(f"{TW_SID}:{TW_TOKEN}".encode()).decode())
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return 200 <= r.status < 300
+    except Exception as ex:
+        print("SMS error:", ex); return False
+
+WELCOME_SMS = ("SafeRoute football test: welcome! Safety first: warm up, drink water, stop if you feel pain. "
+               "Do your 1-min check-in daily: https://saferoute-1-2odj.onrender.com  Reply STOP to opt out.")
+
+def daily_sms_job():
+    """Runs once per server; texts each consenting footballer once a day at SMS_HOUR."""
+    last_day = ""
+    while True:
+        try:
+            local = datetime.utcnow() + timedelta(hours=TZ_OFFSET)
+            today = local.strftime("%Y-%m-%d")
+            if local.hour >= SMS_HOUR and today != last_day:
+                last_day = today
+                for pid, phone, lsd in q_all("SELECT pid,phone,last_sms_date FROM fb_contact WHERE consent='yes'"):
+                    if lsd == today: continue
+                    tip = SAFETY_TIPS[(local.toordinal() + len(pid)) % len(SAFETY_TIPS)]
+                    if send_sms(phone, f"⚽ Safety first: {tip} Daily check-in: https://saferoute-1-2odj.onrender.com"):
+                        q_run("UPDATE fb_contact SET last_sms_date=? WHERE pid=?", (today, pid))
+        except Exception as ex:
+            print("daily sms error:", ex)
+        time.sleep(600)
 
 def fb_save_session(pid, kind, minutes, rpe):
     q_run("INSERT INTO fb_session(pid,ts,kind,minutes,rpe,load)VALUES(?,?,?,?,?,?)",
@@ -377,6 +434,34 @@ class A:
         self.pid = pid; self.S = Sensor(pid); self.alive = True
         self.fb_view = "home"; self.fb_w = {}; self.fb_touched = set()
         self.fb_s = {}; self.fb_s_touched = set(); self.fb_msg = ""; self.fb_result = None
+        self.fb_safety_shown = False
+
+# ══ SAFETY FIRST (football) ════════════════════════════════════
+SAFETY_TIPS = [
+    "Warm up for 10–15 minutes before every session.",
+    "Stop playing if you feel sharp pain. Do not play through it.",
+    "Drink water before, during and after training.",
+    "Sleep 8+ hours before a match. Tired muscles get injured.",
+    "Do not add a big jump in training load in one week.",
+    "Wear proper boots and shin guards, every session.",
+    "Cool down and stretch after playing.",
+    "Heavy soreness today? Take a lighter session or rest.",
+]
+def safety_tip():
+    return SAFETY_TIPS[(datetime.now().toordinal() * 3 + datetime.now().hour) % len(SAFETY_TIPS)]
+
+def show_safety_dialog(page, high_risk=False):
+    title = "🚨 Safety first: high risk today" if high_risk else "⚽ Safety first"
+    body = ("Your risk is high today. Reduce intensity, warm up well, and stop if anything hurts."
+            if high_risk else "Warm up, hydrate, and stop if you feel pain. Your health comes before the game.")
+    page.show_dialog(ft.AlertDialog(
+        modal=True, bgcolor=C["surf"],
+        title=ft.Text(title, size=18, weight=ft.FontWeight.W_700, color=C["warn"] if high_risk else C["fb"]),
+        content=ft.Column(spacing=10, tight=True, controls=[
+            ft.Text(body, size=14, color=C["txt"]),
+            ft.Text("Tip: " + safety_tip(), size=12, color=C["dim"])]),
+        actions=[ft.Button("OK, got it", bgcolor=C["fb"], color="#000", on_click=lambda e: page.pop_dialog())],
+        actions_alignment=ft.MainAxisAlignment.END))
 
 # ══ EMA REMINDER ═══════════════════════════════════════════════
 def show_ema_reminder(page, a, navigate):
@@ -547,18 +632,34 @@ def football_screen(page, a, navigate):
         f_age = field("e.g. 22", str(fp.get("age") or "")); f_pos = drop(POSITIONS, fp.get("position"))
         f_lvl = drop(LEVELS, fp.get("level")); f_prev = drop(["yes", "no"], fp.get("prev_injury"))
         f_wk = drop(["1-2", "3-4", "5+"], fp.get("weekly"))
+        ct = fb_load_contact(a.pid)
+        f_phone = field("Optional, with country code, e.g. +8613800000000", ct.get("phone", ""))
+        f_cons = ft.Checkbox(label="I agree to receive safety-reminder text messages on this number",
+                             value=ct.get("consent") == "yes", active_color=C["fb"])
         def save(e):
             if not (f_age.value and f_pos.value and f_prev.value):
                 err.value = "Age, position and previous-injury answer are required."; page.update(); return
             try: age = int(f_age.value)
             except ValueError: err.value = "Age must be a number."; page.update(); return
+            phone = (f_phone.value or "").strip().replace(" ", "")
+            if phone and not PHONE_RE.match(phone):
+                err.value = "Phone must start with + and country code, e.g. +8613800000000."; page.update(); return
+            if phone and not f_cons.value:
+                err.value = "Tick the consent box to receive texts, or clear the phone number."; page.update(); return
             fb_save_profile(a.pid, {"age": age, "position": f_pos.value, "level": f_lvl.value or "",
                                     "prev_injury": f_prev.value, "weekly": f_wk.value or ""})
+            was = fb_load_contact(a.pid).get("phone")
+            fb_save_contact(a.pid, phone, "yes" if (phone and f_cons.value) else "no")
+            if phone and f_cons.value and phone != was:
+                threading.Thread(target=send_sms, args=(phone, WELCOME_SMS), daemon=True).start()
             toast(page, "Football profile saved ✓"); go("home")
         return wrap([head("Football profile"), fcard("Age", f_age), fcard("Position", f_pos),
                      fcard("Playing level", f_lvl),
                      fcard("Any injury that kept you out of play in the last 12 months?", f_prev),
-                     fcard("Football sessions per week", f_wk), err,
+                     fcard("Football sessions per week", f_wk),
+                     fcard("Phone for safety reminders (optional)", ft.Column(spacing=6, controls=[
+                         f_phone, f_cons, Dim("Used only to text you reminders. Never shared and not in the research data.", 11)])),
+                     err,
                      ft.Button("Save", bgcolor=C["fb"], color="#000", on_click=save, width=float("inf"))])
 
     # ---- daily wellness check-in
@@ -581,6 +682,9 @@ def football_screen(page, a, navigate):
             a.fb_result = (score, t, factors, adv, acwr)
             a.fb_w = {}; a.fb_touched = set()
             toast(page, "✓ Check-in saved"); go("home")
+            if t in ("HIGH", "CRITICAL"):
+                try: show_safety_dialog(page, high_risk=True)
+                except Exception: pass
         sq = lambda lbl, key, lo, hi: slider_q(lbl, 1, 5, 4, lo, hi, tc, w, key, col=C["fb"])
         return wrap([head("Daily check-in"),
                      slider_q("Hours slept last night", 3, 12, 18.0, "3 h", "12 h", tc, w, "sleep_h",
@@ -634,7 +738,14 @@ def football_screen(page, a, navigate):
 
     # ---- home
     last = fb_last_wellness(a.pid)
-    ctrls = [T("⚽ Football", sz=22, bold=True)]
+    ctrls = [T("⚽ Football", sz=22, bold=True),
+             Card(ft.Column(spacing=4, controls=[
+                 T("🛡️ Safety first", sz=14, col=C["fb"], bold=True),
+                 ft.Text(safety_tip(), size=13, color=C["txt"])]), bc=C["fb"] + "66")]
+    if not a.fb_safety_shown:
+        a.fb_safety_shown = True
+        try: show_safety_dialog(page)
+        except Exception: pass
     if not fp:
         ctrls += [Card(ft.Column(spacing=8, controls=[
             T("Set up your football profile", sz=15, bold=True),
@@ -717,7 +828,7 @@ def build_export():
         except Exception: pass
     wb = openpyxl.Workbook(); wb.remove(wb.active)
     c = conn_()
-    for tbl in SCHEMA:
+    for tbl in [t for t in SCHEMA if t not in EXPORT_SKIP]:
         cur = c.execute(f"SELECT * FROM {tbl} ORDER BY id")
         cols = [d[0] for d in cur.description]; rows = cur.fetchall()
         if tbl == "ema":                       # flatten the answers JSON into columns
@@ -736,7 +847,7 @@ def build_export():
             ws.column_dimensions[col[0].column_letter].width = min(max(len(str(x.value or "")) for x in col) + 3, 40)
     ws = wb.create_sheet("summary", 0)
     ws.append(["table", "rows"])
-    for tbl in SCHEMA: ws.append([tbl, c.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]])
+    for tbl in [t for t in SCHEMA if t not in EXPORT_SKIP]: ws.append([tbl, c.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]])
     ws.append([]); ws.append(["exported", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
     c.close()
     name = f"export_{uuid.uuid4().hex[:12]}.xlsx"
@@ -746,7 +857,7 @@ def build_export():
 # ══ SCREEN: PROFILE ════════════════════════════════════════════
 def profile(page, a, navigate):
     ex = db_load_profile(a.pid)
-    f_name = field("e.g. Kwame Mensah", ex.get("name", "")); f_country = field("e.g. Nigeria", ex.get("country", ""))
+    f_name = field("e.g. Musa Mensah", ex.get("name", "")); f_country = field("e.g. The Gambia", ex.get("country", ""))
     f_uni = field("e.g. Central South Univ.", ex.get("university", "")); f_years = field("e.g. 2.5", ex.get("years", ""))
     f_level = drop(["Undergraduate", "Masters", "PhD", "Postdoc"], ex.get("level"))
     f_trans = drop(["Walking", "Cycling", "Bus", "E-scooter", "Car"], ex.get("transport"))
@@ -833,6 +944,7 @@ def start_app(page, pid):
         while a.alive:
             try:
                 if a.S.risk is not None: show_ema_reminder(page, a, navigate)
+                if fb_load_profile(a.pid): toast(page, "⚽ Safety first: " + safety_tip(), C["fb"])
             except Exception: pass
             time.sleep(1800)
 
@@ -857,8 +969,12 @@ def start_app(page, pid):
                              ft.NavigationBarDestination(icon=ft.Icons.PERSON, label="Profile")])]))
     navigate("dashboard")
 
+_JOB = {"on": False}
 def main(page: ft.Page):
     init_db()
+    if not _JOB["on"] and TW_SID:
+        _JOB["on"] = True
+        threading.Thread(target=daily_sms_job, daemon=True).start()
     page.title = "SafeRoute"; page.theme_mode = ft.ThemeMode.DARK
     page.bgcolor = C["bg"]; page.padding = 0
     show_login(page)
